@@ -1,0 +1,21 @@
+{
+  "name": "Quiver Clash",
+  "genre": "fighting",
+  "dim": "2D",
+  "mode": "Versus",
+  "players": "2–4",
+  "hook": "One arrow, one life. Last archer standing wins.",
+  "how": "Shoot in eight directions from a quiver of three, and pull your arrows back out of the walls. A dodge at the right moment catches an arrow out of the air, and landing on a head counts too. The edges wrap around. Last one standing takes the round; first to three rounds wins.",
+  "controls": "Arrow keys with Z, X and C, or a thumb stick with Jump, Shoot and Dodge",
+  "uses": [
+    ["Leaderboard", "The players with the most match wins."],
+    ["Host-run rounds", "The host's browser calls each round, keeps score and hands out the arrows lying around and the chests; if it leaves, the next player takes over."],
+    ["Bots", "Bots fill the empty seats: they hunt, dodge, catch arrows and go back for more."],
+    ["Live sync", "Every archer and every arrow in flight shows up on all screens at once."]
+  ],
+  "ideas": [
+    "Add a laser arrow that goes straight through walls",
+    "Make it a jungle arena with vines you can climb",
+    "Give everyone a shield that blocks one arrow"
+  ]
+}
