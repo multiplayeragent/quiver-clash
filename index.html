@@ -71,6 +71,7 @@
  *   ARCHERS ....... running, jumping, wall-jumps, ducking, dodging, shooting (the same code for people and bots)
  *   ARROWS ........ arrows in flight on every screen: sticking in walls, bouncing, bombs, catches, hits
  *   BOTS .......... the bot brain: hunt, line up a shot, dodge, collect arrows and chests
+ *   BOT ROUTES .... how bots find their way round an arena: every move tried from every spot, then the quickest chain
  *   MATCH (HOST) .. seats, rounds, who is out, the winner, chests, arrows lying around. Only the host writes these.
  *   ME ............ my controls, my shots, my stomps, picking up arrows, my own death
  *   VIEWS ......... everyone else, eased toward their latest state
@@ -142,6 +143,7 @@ const CONFIG = {
   maxChests: 2,          // closed chests at once
   chestArrows: 2,        // special arrows in a chest
   maxLying: 40,          // arrows lying around (the oldest go first)
+  botWait: 1.2,          // seconds into a round before bots shoot (nobody is shot at the word GO)
   botReact: 0.3,         // seconds a bot waits once it has a shot lined up
   botDodge: 0.45,        // chance a bot dodges an arrow about to hit it
   botMiss: 0.25,         // chance a bot's shot goes one direction off
@@ -576,7 +578,7 @@ function botControl(b, all, t, L, dt) {
     if (d < best) { best = d; tg = f; }
   }
   // shoot when someone is on one of my 8 lines, close, with nothing in the way
-  if (tg && b.q) {
+  if (tg && b.q && t > match().endsAt - CONFIG.roundMs + CONFIG.botWait * 1000) {
     const dx = wrapD(tg.x - b.x, WW), dy = wrapD(tg.y - heightOf(tg) / 2 - (b.y - 6), WH), dir = lineUp(dx, dy);
     const ok = dir >= 0 && Math.hypot(dx, dy) < CONFIG.botRange && clearLine(b.x, b.y - 6, dx, dy) && !(b.q.slice(-1) === "b" && Math.hypot(dx, dy) < 40);
     if (ok) {
@@ -602,8 +604,11 @@ function botControl(b, all, t, L, dt) {
   if (t < br.wanderUntil) goal = { x: b.x + br.wdir * 60, y: b.y - 20 };
   if (goal) {
     const gx = wrapD(goal.x - b.x, WW), gy = wrapD(goal.y - b.y, WH);
-    if (Math.abs(gx) > 4) ctl.x = Math.sign(gx);
-    if (goal === tg && b.q && Math.abs(gy) < 8 && Math.abs(gx) < 40) ctl.x = 0; // face-off: hold ground and shoot
+    const faceOff = goal === tg && b.q && Math.abs(gy) < 8 && Math.abs(gx) < 40; // hold ground and shoot
+    const step = faceOff || t < br.wanderUntil ? null : followRoute(b, br, goal, dt);
+    if (step) return Object.assign(ctl, step); // the way there, move by move (see BOT ROUTES)
+    // right next to it, in mid-air, or no known way: just run at it
+    if (Math.abs(gx) > 4 && !faceOff) ctl.x = Math.sign(gx);
     if (t < br.flipUntil) ctl.x = br.flipDir; // going the long way round (the arena wraps)
     const wallAhead = ctl.x && hitsSolid(b.x + ctl.x * 6, b.y - 1, BH - 2);
     br.pushT = ctl.x && (wallAhead || b.wall === ctl.x) ? br.pushT + 1 : 0;
@@ -617,6 +622,120 @@ function botControl(b, all, t, L, dt) {
     br.checkAt = t + 1200; br.sx = b.x; br.sy = b.y;
   }
   return ctl;
+}
+
+// ── BOT ROUTES ──────────────────────────────────────────────────────────────────────
+// A "spot" is a tile an archer can stand in. The first time an arena is used, every basic move
+// below is tried from every spot with the real physics (stepArcher), noting where it lands and
+// how long it takes. A route is then the quickest chain of moves from one spot to another.
+// Change a map, the jump height or the run speed and the routes follow by themselves.
+// A move: x = run this way; jump / drop = how it starts; hold = keep jump held (higher);
+// steer = seconds to keep running once in the air; kick = push off a wall, then run `after`;
+// dash = dodge onward at the top of the jump (0 = level, -1 = upward) to reach further.
+const MOVES = [{ x: 0, jump: true, hold: true, steer: 9 }, { x: 0, drop: true, steer: 9 }]; // straight up (through a ledge), straight down through one
+for (const x of [-1, 1]) {
+  MOVES.push({ x, steer: 9 }, { x, steer: 0 });                                             // walk; off an edge: keep going, or let go and fall
+  for (const steer of [9, 0.25, 0.1]) MOVES.push({ x, jump: true, hold: true, steer }, { x, jump: true, hold: false, steer }); // jumps and hops: far, middling, near
+  MOVES.push({ x, jump: true, hold: true, kick: true, after: -x }, { x, jump: true, hold: true, kick: true, after: x }); // jump at a wall and kick off it: away, or back over its top
+  MOVES.push({ x, jump: true, hold: true, steer: 9, dash: 0 }, { x, jump: true, hold: false, steer: 9, dash: 0 }, { x, jump: true, hold: true, steer: 9, dash: -1 }); // jump, then dash on through the air
+  MOVES.push({ x, drop: true, steer: 9 });                                                  // down through a ledge, drifting sideways
+}
+const SPOTS = COLS * ROWS; // a spot's number = row * COLS + column
+const canStand = (c, r) => tileAt(c, r) !== "#" && tileAt(c, r - 1) !== "#" && "#-".includes(tileAt(c, r + 1));
+/** The spot an archer with its feet at (x, y) stands in (-1: none). At the very edge of a platform it's the tile beside. */
+function spotAt(x, y) {
+  const r = mod(Math.round(y / TILE) - 1, ROWS);
+  for (const dx of [0, -BW / 2, BW / 2]) { const c = Math.floor(mod(x + dx, WW) / TILE); if (canStand(c, r)) return r * COLS + c; }
+  return -1;
+}
+/** The first spot at or below a point: where to stand to get at someone in the air, or at an arrow stuck in stone
+ *  (its tip sits just inside the stone, so the open side is tried too). */
+function spotUnder(x, y) {
+  for (const [dx, dy] of [[0, 0], [0, -4], [0, 4], [-4, 0], [4, 0]]) {
+    const c = Math.floor(mod(x + dx, WW) / TILE), r0 = Math.floor(mod(y + dy - 1, WH) / TILE);
+    if (tileAt(c, r0) === "#") continue;
+    for (let i = 0; i < ROWS; i++) if (canStand(c, r0 + i)) return mod(r0 + i, ROWS) * COLS + c;
+  }
+  return -1;
+}
+/** This frame's controls for a move: start it on the ground, steer it in the air. `st` remembers how far along it is. */
+function moveControl(f, mv, st, dt) {
+  const ctl = { x: mv.x, y: 0, jump: false, jumpHeld: !!mv.hold };
+  if (!st.go) { st.go = true; st.air = 0; ctl.jump = !!(mv.jump || mv.drop); if (mv.drop) { ctl.x = 0; ctl.y = 1; } return ctl; }
+  if (f.ground) return ctl;
+  st.air += dt;
+  if (st.kicked) ctl.x = mv.after;
+  else if (mv.kick) { if (f.wall && f.vy > -120) ctl.jump = st.kicked = true; } // against the wall near the top of the jump: kick
+  else if (mv.dash !== undefined && !st.dashed && f.vy > -40) { ctl.dodge = st.dashed = true; ctl.y = mv.dash; } // at the top of the jump: dash
+  else if (st.air > mv.steer) ctl.x = 0;
+  return ctl;
+}
+/** Try one move from a spot, starting `off` px from the middle of the tile. Returns { to, t } (t in frames), or null if it leads nowhere new. */
+function tryMove(s, mv, off) {
+  const f = Object.assign(newArcher("try"), { x: (s % COLS) * TILE + TILE / 2 + off, y: (Math.floor(s / COLS) + 1) * TILE, ground: true }), st = {};
+  for (let t = 1; t <= 150; t++) {
+    stepArcher(f, moveControl(f, mv, st, 1 / 60), 1 / 60);
+    if (!f.ground) continue;
+    const to = spotAt(f.x, f.y);
+    if (to !== s) return to < 0 ? null : { to, t };
+    if (mv.jump || mv.drop || t > 12) return null; // came down where it started, or walked into a wall
+  }
+  return null;
+}
+/** Learn this arena: every move that works, filed under the spot it lands on (arena.routes.into). Two spots per
+ *  call (the host calls it every frame until `next` reaches SPOTS: under a second, inside the round's intro), so
+ *  the game never stalls. A move only counts if it lands on the same spot from 2 px either side of the middle of the tile. */
+function buildRoutes() {
+  const R = arena.routes || (arena.routes = { into: Array.from({ length: SPOTS }, () => []), to: new Map(), next: 0 });
+  const dust = bits.length;
+  for (let n = 0; n < 2 && R.next < SPOTS; R.next++) {
+    const s = R.next;
+    if (!canStand(s % COLS, Math.floor(s / COLS))) continue;
+    n++;
+    MOVES.forEach((mv, i) => {
+      const a = tryMove(s, mv, -2), b = a && tryMove(s, mv, 2);
+      if (b && a.to === b.to) R.into[a.to].push({ from: s, mv: i, t: Math.max(a.t, b.t) + (mv.jump || mv.drop ? 10 : 0) }); // a jump costs a moment to line up
+    });
+  }
+  bits.length = dust; // sweep up the dust those tries kicked up
+}
+/** For every spot, the first move of the quickest way to `goal` (-1: no way, or already there). Worked out once per goal.
+ *  Null while the arena is still being learned. */
+function routeTo(goal) {
+  const R = arena.routes;
+  if (!R || R.next < SPOTS) return null;
+  let first = R.to.get(goal);
+  if (first) return first;
+  first = new Int8Array(SPOTS).fill(-1);
+  const time = new Float32Array(SPOTS).fill(Infinity), open = [goal];
+  time[goal] = 0;
+  while (open.length) { // spread out from the goal, nearest spots first
+    let k = 0;
+    for (let i = 1; i < open.length; i++) if (time[open[i]] < time[open[k]]) k = i;
+    const s = open.splice(k, 1)[0];
+    for (const e of R.into[s]) {
+      if (time[s] + e.t >= time[e.from]) continue;
+      if (time[e.from] === Infinity) open.push(e.from);
+      time[e.from] = time[s] + e.t; first[e.from] = e.mv;
+    }
+  }
+  R.to.set(goal, first);
+  return first;
+}
+/** A bot's controls for this frame on its way to `goal`, or null when it's there or knows no way (then it just runs at it). */
+function followRoute(b, br, goal, dt) {
+  if (!b.ground) return br.mv ? moveControl(b, br.mv, br.mvSt, dt) : null; // in the air: keep steering the move it started
+  br.mv = null;
+  const from = spotAt(b.x, b.y), to = goal.ground ? spotAt(goal.x, goal.y) : spotUnder(goal.x, goal.y);
+  const first = from < 0 || to < 0 || from === to ? null : routeTo(to), i = first ? first[from] : -1;
+  if (i < 0) return null;
+  const mv = MOVES[i], mid = (from % COLS) * TILE + TILE / 2;
+  if (mv.jump || mv.drop) { // jumps were tried from the middle of the tile, standing still: line up the same way
+    if (Math.abs(b.x - mid) > 2) return { x: Math.sign(mid - b.x), y: 0, jump: false, jumpHeld: true };
+    if (Math.abs(b.vx) > 40) return { x: 0, y: 0, jump: false, jumpHeld: true };
+  }
+  br.mv = mv; br.mvSt = {};
+  return moveControl(b, mv, br.mvSt, dt);
 }
 
 // ── MATCH (HOST) ────────────────────────────────────────────────────────────────────
@@ -730,6 +849,7 @@ function hostTick(dt, now) {
   const t = Date.now();
   if (!m) m = writeMatch(newMatch(1, null));
   useArena(m.arena);
+  buildRoutes(); // the bots learn this arena, a little each frame of its first intro (see BOT ROUTES)
   if (host.loot.r !== roundKey(m)) { host.loot = { r: roundKey(m), a: [], c: [] }; host.lootDirty = true; }
   if (m.phase === "intro" && humansHere().some((id) => !m.seats.includes(id)) && m.seats.some((id) => host.bots.has(id))) m = writeMatch({ ...m, ...fitSeats(m) }); // joined during the intro: take a bot's seat now
   if (m.phase === "intro" && t >= m.startAt) m = writeMatch({ ...m, phase: "fight", endsAt: t + CONFIG.roundMs, chestAt: t + CONFIG.chestFirstMs });
@@ -1235,7 +1355,7 @@ function frame(now) {
   const taken = new Set([...Object.entries(S.entities.players || {}).filter(([id]) => id !== net.sessionId).map(([, p]) => p.c), ...parse(S.shared.bots, []).map((b) => b.c)]);
   me.id = net.sessionId; me.color = COLORS.find((c) => !taken.has(c)) || COLORS[Math.floor(Math.random() * COLORS.length)];
   net.me.set({ n: myName, c: me.color, hb: Date.now() });
-  if (ATTRACT) Object.assign(CONFIG, { introMs: 500, endMs: 1500, resultsMs: 1500, lastStandMs: 400, roundMs: 20000, chestFirstMs: 400, chestEveryMs: 2500, startArrows: 4, botReact: 0.1, botDodge: 0.6, botRange: 230, botWild: 1.2 });
+  if (ATTRACT) Object.assign(CONFIG, { introMs: 500, endMs: 1500, resultsMs: 1500, lastStandMs: 400, roundMs: 20000, chestFirstMs: 400, chestEveryMs: 2500, startArrows: 4, botWait: 0.4, botReact: 0.1, botDodge: 0.6, botRange: 230, botWild: 1.2 });
   last = lastReal = performance.now(); // joining can take a few seconds: that's not a freeze
   requestAnimationFrame(frame);
 })();
